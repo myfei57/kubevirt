@@ -6,6 +6,7 @@ go_library(
         "external.go",
         "restore.go",
         "restore_base.go",
+        "restore_preview.go",
         "snapshot.go",
         "snapshot_base.go",
         "source.go",
@@ -58,6 +59,7 @@ go_test(
     name = "go_default_test",
     srcs = [
         "external_test.go",
+        "restore_preview_test.go",
         "restore_test.go",
         "snapshot_suite_test.go",
         "snapshot_test.go",
