@@ -17,6 +17,7 @@ import (
 	v1 "kubevirt.io/api/core/v1"
 
 	cloudinit "kubevirt.io/kubevirt/pkg/cloud-init"
+	"kubevirt.io/kubevirt/pkg/hooks/deltacontract"
 	api "kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
 )
 
@@ -56,6 +57,20 @@ func (m *MockManager) Collect(arg0 uint, arg1 time.Duration) error {
 func (mr *MockManagerMockRecorder) Collect(arg0, arg1 any) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Collect", reflect.TypeOf((*MockManager)(nil).Collect), arg0, arg1)
+}
+
+// SetDeltaContract mocks base method.
+func (m *MockManager) SetDeltaContract(contract *deltacontract.HookDeltaContract) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SetDeltaContract", contract)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// SetDeltaContract indicates an expected call of SetDeltaContract.
+func (mr *MockManagerMockRecorder) SetDeltaContract(contract any) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetDeltaContract", reflect.TypeOf((*MockManager)(nil).SetDeltaContract), contract)
 }
 
 // OnDefineDomain mocks base method.

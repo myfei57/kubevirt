@@ -35,6 +35,7 @@ import (
 	"kubevirt.io/client-go/log"
 
 	cloudinit "kubevirt.io/kubevirt/pkg/cloud-init"
+	"kubevirt.io/kubevirt/pkg/hooks/deltacontract"
 	hooksInfo "kubevirt.io/kubevirt/pkg/hooks/info"
 	hooksV1alpha1 "kubevirt.io/kubevirt/pkg/hooks/v1alpha1"
 	hooksV1alpha2 "kubevirt.io/kubevirt/pkg/hooks/v1alpha2"
@@ -48,6 +49,7 @@ import (
 const dialSockErr = "Failed to Dial hook socket: %s"
 
 type callBackClient struct {
+	Name                 string
 	SocketPath           string
 	Version              string
 	subscribedHookPoints []*hooksInfo.HookPoint
@@ -59,6 +61,7 @@ var once sync.Once
 type (
 	Manager interface {
 		Collect(uint, time.Duration) error
+		SetDeltaContract(contract *deltacontract.HookDeltaContract) error
 		OnDefineDomain(*virtwrapApi.DomainSpec, *v1.VirtualMachineInstance) (string, error)
 		PreCloudInitIso(*v1.VirtualMachineInstance, *cloudinit.CloudInitData) (*cloudinit.CloudInitData, error)
 		Shutdown() error
@@ -66,6 +69,8 @@ type (
 	hookManager struct {
 		CallbacksPerHookPoint     map[string][]*callBackClient
 		hookSocketSharedDirectory string
+		enforcer                  *deltacontract.Enforcer
+		callbackTimeout           time.Duration
 	}
 )
 
@@ -77,7 +82,28 @@ func GetManager() Manager {
 }
 
 func newManager(baseDir string) *hookManager {
-	return &hookManager{CallbacksPerHookPoint: make(map[string][]*callBackClient), hookSocketSharedDirectory: baseDir}
+	return &hookManager{
+		CallbacksPerHookPoint:     make(map[string][]*callBackClient),
+		hookSocketSharedDirectory: baseDir,
+		callbackTimeout:           time.Minute,
+	}
+}
+
+// SetDeltaContract enables HookDeltaContract enforcement. The contract is the
+// single authority for sidecar permissions; capabilities declared by the
+// sidecars themselves are never trusted. Passing nil disables enforcement and
+// restores the legacy callback behavior.
+func (m *hookManager) SetDeltaContract(contract *deltacontract.HookDeltaContract) error {
+	if contract == nil {
+		m.enforcer = nil
+		return nil
+	}
+	enforcer, err := deltacontract.NewEnforcer(contract)
+	if err != nil {
+		return err
+	}
+	m.enforcer = enforcer
+	return nil
 }
 
 func (m *hookManager) Collect(numberOfRequestedHookSidecars uint, timeout time.Duration) error {
@@ -200,6 +226,7 @@ func processSideCarSocket(socketPath string) (*callBackClient, bool, error) {
 	for _, version := range supportedVersions {
 		if _, found := versionsSet[version]; found {
 			return &callBackClient{
+				Name:                 info.GetName(),
 				SocketPath:           socketPath,
 				Version:              version,
 				subscribedHookPoints: info.GetHookPoints(),
@@ -242,14 +269,67 @@ func (m *hookManager) OnDefineDomain(domainSpec *virtwrapApi.DomainSpec, vmi *v1
 		return "", fmt.Errorf("failed to marshal VMI spec: %v, err: %v", vmi, err)
 	}
 
-	for _, callback := range callbacks {
-		domainSpecXML, err = m.onDefineDomainCallback(callback, domainSpecXML, vmiJSON)
-		if err != nil {
-			return "", err
+	// Enforcement is opt-in. When no contract is configured the chain behaves
+	// exactly as before, preserving the legacy protocol and ordering.
+	if m.enforcer != nil {
+		if err := m.enforcer.ValidateBinding(string(vmi.UID), vmi.Generation, m.collectedIdentities()); err != nil {
+			return "", fmt.Errorf("hook delta contract binding rejected before OnDefineDomain chain: %w", err)
 		}
 	}
 
+	for _, callback := range callbacks {
+		// Keep the exact bytes handed to the sidecar; verification reads them
+		// but never re-marshals, and only accepted raw bytes move forward.
+		inputXML := domainSpecXML
+		outputXML, err := m.onDefineDomainCallback(callback, inputXML, vmiJSON)
+		if err != nil {
+			return "", err
+		}
+
+		if m.enforcer != nil {
+			identity := deltacontract.SidecarIdentity{Name: callback.Name, SocketPath: callback.SocketPath}
+			if err := m.enforcer.Check(identity, callback.Version, inputXML, outputXML); err != nil {
+				// The non-compliant result is dropped: it is neither passed to
+				// another sidecar nor returned to the libvirt define entry.
+				log.Log.Object(vmi).Reason(err).Errorf("Hook delta contract rejected OnDefineDomain output of sidecar %q", callback.Name)
+				return "", fmt.Errorf("hook delta contract rejected sidecar %q: %w", callback.Name, err)
+			}
+		}
+
+		domainSpecXML = outputXML
+	}
+
 	return string(domainSpecXML), nil
+}
+
+// collectedIdentities returns the de-duplicated socket identities gathered
+// during Collect across every hook point.
+func (m *hookManager) collectedIdentities() []deltacontract.SidecarIdentity {
+	seen := make(map[string]struct{})
+	identities := make([]deltacontract.SidecarIdentity, 0)
+	for _, clients := range m.CallbacksPerHookPoint {
+		for _, client := range clients {
+			identity := deltacontract.SidecarIdentity{Name: client.Name, SocketPath: client.SocketPath}
+			key := client.SocketPath + "\x00" + client.Name
+			if _, exists := seen[key]; exists {
+				continue
+			}
+			seen[key] = struct{}{}
+			identities = append(identities, identity)
+		}
+	}
+	return identities
+}
+
+// callbackCanceledError reports timeout/cancellation without implying that any
+// external effect the sidecar already produced could be rolled back.
+type callbackCanceledError struct {
+	name    string
+	timeout time.Duration
+}
+
+func (e *callbackCanceledError) Error() string {
+	return fmt.Sprintf("OnDefineDomain callback %q timed out after %s or was canceled: the connection was closed and the callback chain was stopped; external effects already produced by the sidecar are not rolled back", e.name, e.timeout)
 }
 
 func (m *hookManager) onDefineDomainCallback(callback *callBackClient, domainSpecXML, vmiJSON []byte) ([]byte, error) {
@@ -260,48 +340,56 @@ func (m *hookManager) onDefineDomainCallback(callback *callBackClient, domainSpe
 	}
 	defer conn.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), m.callbackTimeout)
 	defer cancel()
 
+	var result []byte
 	switch callback.Version {
 	case hooksV1alpha1.Version:
 		client := hooksV1alpha1.NewCallbacksClient(conn)
-		result, err := client.OnDefineDomain(ctx, &hooksV1alpha1.OnDefineDomainParams{
+		response, err := client.OnDefineDomain(ctx, &hooksV1alpha1.OnDefineDomainParams{
 			DomainXML: domainSpecXML,
 			Vmi:       vmiJSON,
 		})
 		if err != nil {
 			log.Log.Reason(err).Error("Failed to call OnDefineDomain")
-			return nil, err
+			return nil, m.classifyCallbackError(callback, ctx, err)
 		}
-		domainSpecXML = result.GetDomainXML()
+		result = response.GetDomainXML()
 	case hooksV1alpha2.Version:
 		client := hooksV1alpha2.NewCallbacksClient(conn)
-		result, err := client.OnDefineDomain(ctx, &hooksV1alpha2.OnDefineDomainParams{
+		response, err := client.OnDefineDomain(ctx, &hooksV1alpha2.OnDefineDomainParams{
 			DomainXML: domainSpecXML,
 			Vmi:       vmiJSON,
 		})
 		if err != nil {
 			log.Log.Reason(err).Error("Failed to call OnDefineDomain")
-			return nil, err
+			return nil, m.classifyCallbackError(callback, ctx, err)
 		}
-		domainSpecXML = result.GetDomainXML()
+		result = response.GetDomainXML()
 	case hooksV1alpha3.Version:
 		client := hooksV1alpha3.NewCallbacksClient(conn)
-		result, err := client.OnDefineDomain(ctx, &hooksV1alpha3.OnDefineDomainParams{
+		response, err := client.OnDefineDomain(ctx, &hooksV1alpha3.OnDefineDomainParams{
 			DomainXML: domainSpecXML,
 			Vmi:       vmiJSON,
 		})
 		if err != nil {
 			log.Log.Reason(err).Error("Failed to call OnDefineDomain")
-			return nil, err
+			return nil, m.classifyCallbackError(callback, ctx, err)
 		}
-		domainSpecXML = result.GetDomainXML()
+		result = response.GetDomainXML()
 	default:
 		log.Log.Errorf("Unsupported callback version: %s", callback.Version)
 	}
 
-	return domainSpecXML, nil
+	return result, nil
+}
+
+func (m *hookManager) classifyCallbackError(callback *callBackClient, ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return &callbackCanceledError{name: callback.Name, timeout: m.callbackTimeout}
+	}
+	return err
 }
 
 func preCloudInitIsoDataToJSON(vmi *v1.VirtualMachineInstance, cloudInitData *cloudinit.CloudInitData) ([]byte, []byte, []byte, error) {

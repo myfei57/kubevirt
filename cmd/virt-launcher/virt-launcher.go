@@ -414,6 +414,19 @@ func main() {
 		panic(err)
 	}
 
+	// Optionally enable HookDeltaContract enforcement. When the environment
+	// variable is unset the legacy, non-enforcing callback behavior is kept.
+	if contractPath := os.Getenv(hooks.HookDeltaContractEnvVar); contractPath != "" {
+		contract, err := hooks.LoadDeltaContractFromFile(contractPath)
+		if err != nil {
+			panic(err)
+		}
+		if err := hookManager.SetDeltaContract(contract); err != nil {
+			panic(err)
+		}
+		log.Log.Infof("Hook delta contract enforcement enabled from %s", contractPath)
+	}
+
 	vmi := v1.NewVMIReferenceWithUUID(*namespace, *name, types.UID(*uid))
 
 	ephemeralDiskCreator := ephemeraldisk.NewEphemeralDiskCreator(filepath.Join(*ephemeralDiskDir, "disk-data"))

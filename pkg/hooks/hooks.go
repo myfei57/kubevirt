@@ -25,10 +25,18 @@ import (
 	k8sv1 "k8s.io/api/core/v1"
 
 	v1 "kubevirt.io/api/core/v1"
+
+	"kubevirt.io/kubevirt/pkg/hooks/deltacontract"
 )
 
 const HookSidecarListAnnotationName = "hooks.kubevirt.io/hookSidecars"
 const HookSocketsSharedDirectory = "/var/run/kubevirt-hooks"
+
+// HookDeltaContractEnvVar optionally points to a HookDeltaContract JSON file.
+// When unset, OnDefineDomain keeps its legacy, non-enforcing behavior. When
+// set, every sidecar callback result is verified against the contract before
+// it is accepted, and non-compliant results never reach libvirt.
+const HookDeltaContractEnvVar = "HOOK_DELTA_CONTRACT_PATH"
 
 const ContainerNameEnvVar = "CONTAINER_NAME"
 const NetworkBindingPluginNameEnvVar = "NETWORK_BINDING_PLUGIN_NAME"
@@ -57,6 +65,12 @@ type HookSidecar struct {
 	DownwardAPI              v1.NetworkBindingDownwardAPIType `json:"-"`
 	NetworkBindingPluginName string                           `json:"-"`
 	ResourceClaims           []k8sv1.ResourceClaim            `json:"-"`
+}
+
+// LoadDeltaContractFromFile reads and validates an optional HookDeltaContract
+// from a JSON file.
+func LoadDeltaContractFromFile(filePath string) (*deltacontract.HookDeltaContract, error) {
+	return deltacontract.LoadDeltaContract(filePath)
 }
 
 func UnmarshalHookSidecarList(vmiObject *v1.VirtualMachineInstance) (HookSidecarList, error) {
