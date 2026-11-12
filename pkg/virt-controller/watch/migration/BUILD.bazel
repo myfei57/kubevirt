@@ -6,6 +6,7 @@ go_library(
         "decentralized.go",
         "migration.go",
         "migrationpolicy.go",
+        "migrationpolicy_minimize.go",
     ],
     importpath = "kubevirt.io/kubevirt/pkg/virt-controller/watch/migration",
     visibility = ["//visibility:public"],
@@ -49,6 +50,7 @@ go_test(
     srcs = [
         "migration_suite_test.go",
         "migration_test.go",
+        "migrationpolicy_minimize_test.go",
         "migrationpolicy_test.go",
     ],
     embed = [":go_default_library"],
