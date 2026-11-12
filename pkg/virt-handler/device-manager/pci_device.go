@@ -156,16 +156,24 @@ func constructDPIdevices(pciDevices []*PCIDevice, iommuToPCIMap map[string]strin
 
 func (dpi *PCIDevicePlugin) Allocate(_ context.Context, r *pluginapi.AllocateRequest) (*pluginapi.AllocateResponse, error) {
 	resourceNameEnvVar := util.ResourceNameToEnvVar(v1.PCIResourcePrefix, dpi.resourceName)
-	allocatedDevices := []string{}
 	resp := new(pluginapi.AllocateResponse)
-	containerResponse := new(pluginapi.ContainerAllocateResponse)
 
 	for _, request := range r.ContainerRequests {
+		// Every container request gets its own response object, devices slice and
+		// env map. Allocating them inside the loop guarantees that containers never
+		// share pointers or backing storage, that PCI addresses only contain the
+		// IOMMU groups allocated to that container, and that repeated Allocate calls
+		// cannot reuse state left over from a previous iteration or call.
+		containerResponse := new(pluginapi.ContainerAllocateResponse)
+		allocatedDevices := make([]string, 0, len(request.DevicesIDs))
 		deviceSpecs := make([]*pluginapi.DeviceSpec, 0)
 		for _, devID := range request.DevicesIDs {
 			// translate device's iommu group to its pci address
 			devPCIAddress, exist := dpi.iommuToPCIMap[devID]
 			if !exist {
+				// Unknown IDs are skipped according to the existing allocation
+				// protocol; skipping only affects the current container because all
+				// allocation state is scoped to this iteration.
 				continue
 			}
 			allocatedDevices = append(allocatedDevices, devPCIAddress)
